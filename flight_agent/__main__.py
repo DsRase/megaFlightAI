@@ -12,31 +12,22 @@ from pathlib import Path
 
 from langchain_openai import ChatOpenAI
 from . import BASE_URL, MODEL
-from .agent import redact, respond, create_agent, safe_result, search_conditions, search_clarifications
-from .diagnostics import error_answer
-from .data import FlightStore
+from .agent import SAVED_PASSPORT_MISSING, redact, respond, create_agent, safe_result, search_label, search_clarifications, prepared_booking_message
+from .diagnostics import BOOKING_OUTCOME_UNKNOWN, DATA_UNAVAILABLE, error_answer
+from .data import PASSPORT, FlightStore
 
 WAITING_MESSAGES = (
     "Сверяем курс", "Ищем попутный ветер", "Готовим взлёт", "Проверяем табло",
     "Считаем облака", "Прокладываем маршрут", "Расправляем крылья", "Ищем свободный гейт",
     "Прогреваем двигатели", "Ловим сигнал диспетчера", "Пристёгиваем мысли", "Заходим на посадку",
 )
-
-
-class PlainTextModel:
-    """Добавить требование к оформлению, сохранив протокол агента."""
-
-    def __init__(self, model):
-        self.model = model
-
-    def bind_tools(self, tools):
-        return PlainTextModel(self.model.bind_tools(tools))
-
-    def invoke(self, messages):
-        messages = list(messages)
-        messages[0] = messages[0].model_copy(update={"content": messages[0].content +
-            "\nВ поле message отвечай обычным текстом, без Markdown и разметки."})
-        return self.model.invoke(messages)
+INTERNAL_TOOL_MESSAGES = (
+    "Достигнут предел вызовов инструментов.",
+    "Допускается один вызов бронирования за ход.",
+    "Неизвестный инструмент.",
+    "Не удалось сохранить профиль.",
+    DATA_UNAVAILABLE,
+)
 
 
 @contextmanager
@@ -103,10 +94,11 @@ def terminal_input():
         termios.tcsetattr(fd, termios.TCSANOW, original)
 
 
-def print_result(answer, trace, stream=None):
+def print_result(answer, trace, stream=None, *, store=None):
     print = partial(builtins.print, file=stream)
+    output = io.StringIO()
     try:
-        _print_result(answer, trace, stream)
+        _print_result(answer, trace, output, store)
     except Exception:
         booking = next((item.get("result", {}) for item in (trace or []) if isinstance(item, dict) and item.get("tool") == "book_flight" and item.get("executed") is not False and isinstance(item.get("result"), dict) and item["result"].get("status") in ("booked", "duplicate")), None)
         status = booking.get("status") if booking else None
@@ -116,7 +108,9 @@ def print_result(answer, trace, stream=None):
             if isinstance(booking_id, str) and re.fullmatch(r"DEMO-\d{4,}", booking_id):
                 print("Номер брони:", booking_id)
         else:
-            print("Не удалось обработать запрос. Попробуйте ещё раз.")
+            print(DATA_UNAVAILABLE)
+    else:
+        print(output.getvalue().rstrip("\n") or DATA_UNAVAILABLE)
 
 
 def plain_text(text):
@@ -164,6 +158,10 @@ def print_tool_result(name, result, stream=None):
     message = result.get("message")
     if name in ("get_profile", "set_profile") and result.get("status") == "ok" and result.get("name"):
         print(("Ваше имя: " if name == "get_profile" else "Имя сохранено: ") + result["name"] + ".")
+    elif name == "prepare_booking" and result.get("flight"):
+        message = prepared_booking_message(result)
+        if message:
+            print(plain_text(message))
     elif name == "book_flight" and result.get("status") in ("booked", "duplicate"):
         print("Бронь создана." if result["status"] == "booked" else "Бронь для этого пассажира уже существует.")
         if result.get("booking_id") and result["booking_id"] != "***":
@@ -208,8 +206,6 @@ def print_tool_result(name, result, stream=None):
         print("Укажите, пожалуйста: " + ", ".join(labels[field] for field in result["missing_fields"]) + ".")
     elif message and message != "***":
         print(plain_text(message))
-    else:
-        print("Не удалось получить сведения. Попробуйте ещё раз.")
     alternatives = result.get("alternatives", [])
     if alternatives:
         print(f"Подходящих альтернатив: {len(alternatives)}.")
@@ -217,23 +213,54 @@ def print_tool_result(name, result, stream=None):
             print_flight(flight, f"{number}. ", stream)
 
 
-def _print_result(answer, trace, stream=None):
+def _print_result(answer, trace, stream=None, store=None):
     print = partial(builtins.print, file=stream)
     info = safe_result(answer).get("diagnostic", {})
     records = [item for item in (trace or []) if isinstance(item, dict)
                and isinstance(item.get("result"), dict)]
-    if any(item.get("tool") == "book_flight" and item["result"].get("message") != "Допускается один вызов бронирования за ход." for item in records):
-        records = [item for item in records if not (item.get("tool") == "book_flight" and item.get("executed") is False and item["result"].get("message") == "Допускается один вызов бронирования за ход.")]
-    if any(item.get("tool") == "book_flight" and item["result"].get("status") in ("booked", "duplicate") for item in records):
-        records = [item for item in records if item.get("tool") != "search_flights"]
+    tool_result_count = len(records)
+    records = [
+        item for item in records
+        if item["result"].get("message") not in INTERNAL_TOOL_MESSAGES
+        and (item["result"].get("status") != "error"
+             or not item["result"].get("diagnostic")
+             or item["result"].get("message") == BOOKING_OUTCOME_UNKNOWN)
+    ]
+    hidden_tool_errors = len(records) != tool_result_count
+    booked = any(item.get("tool") == "book_flight" and item["result"].get("status") in ("booked", "duplicate") for item in records)
+    prepared = any(item.get("tool") == "prepare_booking" and item.get("executed") is not False for item in records)
+    if booked or prepared:
+        records = [item for item in records if not (
+            item.get("tool") == "get_profile" and item["result"].get("status") in ("ok", "not_found")
+            or booked and item.get("tool") in ("search_flights", "set_profile") and item["result"].get("status") == "ok"
+            or booked and item.get("tool") == "prepare_booking" and item["result"].get("flight")
+        )]
     natural = answer.get("message", "")
     natural_tools = records and all(item.get("tool") in ("search_flights", "flight_status", "list_bookings") for item in records)
-    def print_record(item):
-        if item.get("tool") == "search_flights" and isinstance(item.get("arguments"), dict):
-            print("Условия поиска: " + search_conditions(item["arguments"]) + ".")
-        print_tool_result(item["tool"], item["result"], stream)
+    search_count = sum(item.get("tool") == "search_flights" for item in records)
+    search_number = 0
 
-    if natural_tools and isinstance(natural, str) and natural and natural not in ("Поиск выполнен.", "Не удалось получить данные рейса.") and not info:
+    def print_record(item):
+        nonlocal search_number
+        name, result = item["tool"], item["result"]
+        if name == "show_saved_passport" and item.get("executed") is True:
+            if result.get("status") == "not_found":
+                print(SAVED_PASSPORT_MISSING)
+                return
+            if result.get("status") == "ok":
+                expected_name = result.get("name")
+                if store is not None and isinstance(expected_name, str) and expected_name:
+                    passport = store.get_profile_passport(expected_name)
+                    print(f"Номер паспорта: {passport}." if PASSPORT.fullmatch(passport) else SAVED_PASSPORT_MISSING)
+                else:
+                    print("В профиле сохранён паспорт.")
+                return
+        if name == "search_flights" and search_count > 1:
+            search_number += 1
+            print(plain_text(search_label(search_number, item.get("arguments"))))
+        print_tool_result(name, result, stream)
+
+    if natural_tools and isinstance(natural, str) and natural and natural not in ("Поиск выполнен.", "Не удалось получить данные рейса.") and not info and not hidden_tool_errors:
         if not all(item.get("tool") == "search_flights" for item in records) or "Ближайший рейс:" in natural:
             print(plain_text(redact(natural)))
         else:
@@ -248,25 +275,19 @@ def _print_result(answer, trace, stream=None):
     elif records:
         for item in records:
             print_record(item)
-    else:
+    elif not tool_result_count:
         message = answer.get("message", "")
         if answer.get("status") in ("booked", "duplicate"):
-            message = "Не удалось подтвердить результат бронирования. Попробуйте ещё раз."
-        elif info.get("category") == "invalid_response":
-            message = "Не удалось получить понятный ответ."
-        print(plain_text(redact(message)) if isinstance(message, str) and message else "Не удалось получить ответ. Попробуйте ещё раз.")
-    if info and records:
-        print("Не удалось полностью обработать запрос.")
-    action = info.get("action")
-    if info.get("category") == "invalid_response":
-        action = "Попробуйте ещё раз; если ошибка повторится, обратитесь к разработчику."
-    if action and (records or action not in str(answer.get("message", ""))):
-        print(plain_text(action))
+            message = BOOKING_OUTCOME_UNKNOWN
+        elif info and answer.get("status") != "missing_fields" and message != BOOKING_OUTCOME_UNKNOWN:
+            message = DATA_UNAVAILABLE
+        if isinstance(message, str) and message:
+            print(plain_text(redact(message)))
 
 
-def format_result(answer, trace):
+def format_result(answer, trace, store=None):
     stream = io.StringIO()
-    print_result(answer, trace, stream)
+    print_result(answer, trace, stream, store=store)
     return stream.getvalue().strip()
 
 
@@ -280,7 +301,7 @@ def main():
         db_path = os.environ.get("FLIGHT_DB_PATH", "./data/flights.sqlite3")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         store = FlightStore(db_path)
-        graph = create_agent(PlainTextModel(model), store)
+        graph = create_agent(model, store)
     except Exception as exc:
         print_result(error_answer(exc, "application"), [])
         return 1
@@ -311,7 +332,10 @@ def main():
             except Exception as exc:
                 print_result(error_answer(exc, "application"), None)
                 continue
-            print_result(answer, trace)
+            if any(item.get("tool") == "show_saved_passport" for item in (trace or [])):
+                print_result(answer, trace, store=store)
+            else:
+                print_result(answer, trace)
             if answer.get("_interrupted"):
                 break
     return 0

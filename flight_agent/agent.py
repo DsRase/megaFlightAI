@@ -12,16 +12,24 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from .data import FlightStore
-from .diagnostics import diagnostic, error_answer
+from .diagnostics import BOOKING_OUTCOME_UNKNOWN, DATA_UNAVAILABLE, diagnostic, error_answer
 
 
 SYSTEM_PROMPT = """Ты русскоязычный помощник по авиарейсам и бронированию в учебном
-сценарии. Общайся как обычный помощник: естественно, по существу и с учётом
+сценарии. Занимайся только поиском и статусами рейсов, учебным бронированием
+и профилем для него. Если запрос целиком вне этой темы (например, просьба
+написать код), ответь одной короткой фразой по-русски: «Я помогаю с рейсами
+и бронированием.» Не разбирай постороннюю задачу и не вызывай инструменты.
+В смешанном запросе обработай только часть о рейсах, бронировании или профиле.
+Общайся как обычный помощник: естественно, по существу и с учётом
 предыдущих сообщений. Не повторяй без необходимости, что сценарий учебный или
 данные ненастоящие; если об этом спрашивают, отвечай честно. Отвечай простым
-текстом, без Markdown и JSON. На приветствия, общие вопросы и просьбы о пояснении
-отвечай без лишних вызовов. Если намерение или нужные данные неясны, задай
-подходящий контексту уточняющий вопрос.
+текстом, без Markdown и JSON. Если часть данных недоступна, сообщи то, что
+удалось получить. Не упоминай инструменты, диагностические подробности и
+настройки приложения. На приветствия отвечай кратко в рамках своей
+роли, а на вопросы о ней и просьбы о пояснении по теме — без лишних вызовов.
+Если намерение или нужные данные неясны, задай подходящий контексту
+уточняющий вопрос.
 
 Для поиска или подсчёта рейсов и доступных вариантов бронирования используй
 search_flights, даже если маршрут или дата не указаны. Фильтруй по известным
@@ -29,32 +37,42 @@ search_flights, даже если маршрут или дата не указа
 Вопросы о рейсах понимай как запросы к имеющемуся расписанию. Без даты ищи во
 всём расписании, не выдавай его за данные реального времени. count — общее число
 совпадений, список может быть сокращён. Если спрашивают как бронировать, объясни порядок,
-а если ищут варианты — выполни поиск. Для статуса конкретного рейса используй
-flight_status; не придумывай расписание, статус или наличие мест. Для создания
+а если ищут варианты — выполни поиск. Вызывай flight_status только при явном
+запросе статуса конкретного рейса с известным номером. Не придумывай расписание,
+статус или наличие мест. Для создания
 брони используй book_flight, только когда известны номер и дата рейса, имя
 пассажира и паспорт. Дата — YYYY-MM-DD, паспорт — ровно 10 цифр. Если данные
 отсутствуют, запроси их; не угадывай имя пассажира. Если указаны авиакомпания
 или маршрут, передай их инструменту. Паспорт текущего сообщения передавай как
-полученный маркер PVT_* без изменений. Для явно своей активной брони используй
-PVT_PROFILE только если сообщено, что паспорт профиля доступен. Не пытайся
+полученный маркер PVT_* без изменений. Для явно своей брони передай own=true.
+Если паспорт профиля доступен, передай PVT_PROFILE. Не пытайся
 восстановить и не повторяй паспорт или маркер. Другие паспорта предыдущих ходов
 недоступны: при необходимости попроси их снова.
 
 Когда пользователь сообщает своё имя, запиши его через set_profile. Для вопроса
-о сохранённом имени используй get_profile; для изменения — set_profile, для
-удаления — delete_profile. Профиль общий для приложения, не угадывай имя и
+о сохранённом имени или наличии паспорта используй get_profile; для изменения
+имени используй set_profile, для удаления профиля — delete_profile. Только если
+пользователь явно просит показать или сверить сам номер своего сохранённого
+паспорта, вызови show_saved_passport. Приложение выведет номер в чате. Профиль
+общий для приложения, не угадывай имя и
 не записывай паспорт через инструмент профиля. Имя пользователя и имя пассажира
 не обязательно совпадают; используй имя профиля только для явно своей брони.
 
-Для ближайшего доступного рейса вызови search_flights по маршруту с
-available_only=true, from_now=true и limit=1. Сообщи первый подходящий рейс или
-отсутствие будущих рейсов в учебном расписании. Выбор рейса ещё не означает бронь.
-При просьбе забронировать помни выбор и уточнения, запроси только недостающие
-данные и вызови book_flight, когда они известны. Проверка «а паспорт сохранён?»
-сама по себе не является просьбой действовать. Новая бронь требует новой просьбы.
+Если хотят только узнать ближайший рейс, вызови search_flights с available_only=true,
+from_now=true и limit=1. Если хотят оформить первый доступный будущий рейс,
+вызови prepare_booking с маршрутом, даже если просьба разговорная или с опечатками.
+Для своей брони передай own=true. Подготовка выбирает рейс и показывает недостающие
+данные. Когда пользователь пришлёт их или подтвердит выбор с данными профиля,
+вызови book_flight с выбранным рейсом и данными пассажира. В ходе заполнения
+можно передать уже известное и оставить недостающие поля пустыми.
+Сам вопрос о сохранённом паспорте не разрешает бронирование. Если пользователь
+отменяет выбор или переходит к другой брони, вызови clear_pending_booking перед
+новым book_flight или выбери другой рейс через prepare_booking.
 Используй реальные вызовы инструментов, не печатай их как текст.
 
-Для списка активных броней используй list_bookings. Для отмены используй
+Для списка активных броней используй list_bookings: он уже возвращает статус
+каждого рейса из расписания. На вопрос «кто я и какие на мне брони?» используй
+get_profile и list_bookings. Для отмены используй
 cancel_booking с номером DEMO-..., только по просьбе пользователя; если номер
 неясен, запроси его или покажи список. Повторная отмена already_cancelled=true
 означает, что бронь была отменена ранее. Для переноса используй update_booking
@@ -86,6 +104,7 @@ FIELD_LABELS = {
 }
 MODEL_RESPONSE_ACTION = "Повторите запрос; проверьте формат ответа модели и поддержку вызовов инструментов."
 PASSPORT_RESUBMISSION = "Укажите паспорт повторно: данные предыдущего хода не сохраняются."
+SAVED_PASSPORT_MISSING = "В профиле нет сохранённого паспорта."
 VAULT = ContextVar("passport_vault", default=None)
 JOURNAL = ContextVar("turn_journal", default=None)
 
@@ -109,8 +128,11 @@ SAFE_MESSAGES = {
     "Новый рейс неоднозначен; уточните рейс.",
     "Найдено несколько рейсов; уточните авиакомпанию и маршрут.",
     "Найдено несколько рейсов с этим номером и датой.",
-    "Результат операции неизвестен. Проверьте состояние броней перед повторной отправкой.",
+    BOOKING_OUTCOME_UNKNOWN,
     "Имя пользователя не сохранено.", "Укажите корректное имя пользователя.", "Профиль удалён.",
+    "Укажите маршрут.", "Нет подходящих рейсов.", "Незавершённое бронирование отменено.",
+    "Не удалось сохранить профиль.",
+    DATA_UNAVAILABLE,
     PASSPORT_RESUBMISSION,
 }
 SAFE_ACTIONS = {
@@ -133,25 +155,25 @@ def safe_arguments(args):
     for key in ("passport", "passenger_name"):
         if key in args:
             result[key] = "***"
-    for key in ("available_only", "from_now"):
+    for key in ("available_only", "from_now", "own"):
         if type(args.get(key)) is bool:
             result[key] = args[key]
     if type(args.get("limit")) is int:
         result["limit"] = args["limit"]
-    if any(key not in allowed | {"passport", "passenger_name", "available_only", "from_now", "limit"} for key in args):
+    if any(key not in allowed | {"passport", "passenger_name", "available_only", "from_now", "limit", "own"} for key in args):
         result["other_fields"] = "***"
     return result
 
 
 def safe_result(result):
     if not isinstance(result, dict):
-        return {"status": "error", "message": "Не удалось получить данные инструмента."}
+        return {"status": "error", "message": DATA_UNAVAILABLE}
     output = {}
     status = result.get("status")
     if status in ("ok", "error", "missing_fields", "booked", "duplicate", "not_found", "sold_out", "cancelled", "updated"):
         output["status"] = status
     message = result.get("message")
-    if isinstance(message, str) and (message in SAFE_MESSAGES or any(message == "Не удалось выполнить инструмент. " + action for action in SAFE_ACTIONS)):
+    if isinstance(message, str) and message in SAFE_MESSAGES:
         output["message"] = message
     elif message is not None:
         output["message"] = "***"
@@ -175,6 +197,8 @@ def safe_result(result):
         output["count"] = result["count"]
     if type(result.get("truncated")) is bool:
         output["truncated"] = result["truncated"]
+    if type(result.get("saved_document_available")) is bool:
+        output["saved_document_available"] = result["saved_document_available"]
     if isinstance(result.get("flights"), list):
         output["flights"] = [safe_flight(v) for v in result["flights"][:10] if isinstance(v, dict)]
     if isinstance(result.get("missing_fields"), list):
@@ -192,7 +216,7 @@ def safe_result(result):
         ]
     if isinstance(result.get("diagnostic"), dict):
         d = result["diagnostic"]
-        output["diagnostic"] = {k: v for k, v in d.items() if (k == "source" and v in ("model", "tool", "application")) or (k == "category" and v in ("timeout", "connection", "authentication", "rate_limit", "service", "request", "unexpected", "invalid_response")) or (k == "action" and isinstance(v, str) and v in SAFE_ACTIONS) or (k == "code" and v in ("value_error", "type_error", "key_error", "runtime_error", "os_error", "other_error", "empty_content", "invalid_format", "invalid_tool_call")) or (k == "http_status" and type(v) is int and 100 <= v <= 599)}
+        output["diagnostic"] = {k: v for k, v in d.items() if (k == "source" and v in ("model", "tool", "application")) or (k == "category" and v in ("timeout", "connection", "authentication", "rate_limit", "service", "request", "unexpected", "invalid_response")) or (k == "action" and isinstance(v, str) and v in SAFE_ACTIONS) or (k == "code" and v in ("value_error", "type_error", "key_error", "runtime_error", "os_error", "other_error", "empty_content", "invalid_format", "invalid_tool_call", "invalid_tool_arguments")) or (k == "http_status" and type(v) is int and 100 <= v <= 599)}
     return output
 
 
@@ -265,6 +289,7 @@ class AgentState(TypedDict):
     rounds: int
     trace: list
     results: list
+    pending_booking: dict | None
 
 
 def normalize_history(messages):
@@ -287,7 +312,7 @@ def normalize_history(messages):
     return normalized
 
 
-TOOL_NAMES = ("flight_status", "book_flight", "search_flights", "get_profile", "set_profile", "delete_profile", "list_bookings", "cancel_booking", "update_booking")
+TOOL_NAMES = ("flight_status", "book_flight", "search_flights", "prepare_booking", "clear_pending_booking", "get_profile", "show_saved_passport", "set_profile", "delete_profile", "list_bookings", "cancel_booking", "update_booking")
 
 
 def compact_history(messages, max_chars=24000, recent_turns=6):
@@ -310,7 +335,42 @@ def compact_history(messages, max_chars=24000, recent_turns=6):
     return messages[cutoff:], [RemoveMessage(id=m.id) for m in removed]
 
 
+def prepared_booking_message(result):
+    flight = result.get("flight")
+    if not flight:
+        return result.get("message", "")
+    departure = flight["departure"].replace("T", " ")
+    message = f"Ближайший рейс: {flight['flight_number']}, {flight['origin']} — {flight['destination']}, вылет {departure}. Свободных мест: {flight['seats']}."
+    fields = ["10 цифр паспорта" if field == "passport" else FIELD_LABELS[field] for field in result.get("missing_fields", [])]
+    return message + (" Пришлите " + " и ".join(fields) + "." if fields else " Подтвердите бронирование.")
+
+
 def make_tools(store):
+    def read_profile():
+        profile = store.get_profile()
+        if profile.get("name"):
+            profile["saved_document_available"] = bool(getattr(store, "get_profile_passport", lambda name: "")(profile["name"]))
+        return profile
+
+    @tool
+    def prepare_booking(origin: str, destination: str, own: bool = False) -> dict:
+        """Подготовить бронь на первый доступный будущий рейс по маршруту. Используй при просьбе оформить перелёт, например «заведи на меня ближайший рейс из Сочи в Москву». Имя и паспорт для выбора не нужны. own=true только для брони на самого пользователя. Возвращает выбранный рейс и недостающие поля. Для просмотра расписания используй search_flights."""
+        if not origin.strip() or not destination.strip():
+            return {"status": "missing_fields", "message": "Укажите маршрут."}
+        search = store.search(origin, destination, "", True, 1, True)
+        if search.get("status") != "ok":
+            return search
+        if not search["flights"]:
+            return {"status": "not_found", "message": "Нет подходящих рейсов."}
+        profile = read_profile() if own else {}
+        missing = ([] if profile.get("name") else ["passenger_name"]) + ([] if profile.get("saved_document_available") else ["passport"])
+        return {"status": "missing_fields" if missing else "ok", "flight": safe_flight(search["flights"][0]), "missing_fields": missing}
+
+    @tool
+    def clear_pending_booking() -> dict:
+        """Отменить незавершённое намерение бронирования перед новым запросом или по просьбе пользователя."""
+        return {"status": "ok", "message": "Незавершённое бронирование отменено."}
+
     @tool
     def search_flights(origin: str = "", destination: str = "", flight_date: str = "", available_only: bool = False, limit: int = 10, from_now: bool = False) -> dict:
         """Искать в учебном расписании. from_now ограничивает вылеты текущим местным временем и будущим; без фильтра ищет во всём расписании. Возвращает count и не более 10 рейсов."""
@@ -318,18 +378,26 @@ def make_tools(store):
 
     @tool
     def flight_status(flight_number: str, flight_date: str = "") -> dict:
-        """Найти статус рейса по номеру и, если необходимо, дате YYYY-MM-DD."""
+        """Ответить на явный запрос статуса конкретного рейса с известным номером. Дата YYYY-MM-DD необязательна."""
         return store.status(flight_number, flight_date)
 
     @tool
-    def book_flight(flight_number: str, flight_date: str, passenger_name: str, passport: str, airline: str = "", origin: str = "", destination: str = "") -> dict:
-        """Создать бронь в приложении по номеру и дате рейса, имени и 10 цифрам паспорта."""
+    def book_flight(flight_number: str, flight_date: str, passenger_name: str, passport: str, airline: str = "", origin: str = "", destination: str = "", own: bool = False) -> dict:
+        """Создать бронь по номеру и дате рейса, имени и маркеру паспорта. После prepare_booking используй выбранный рейс. own=true разрешает использовать профиль только при явно своей брони. Для паспорта профиля передай PVT_PROFILE, если он доступен."""
         return store.book(flight_number, flight_date, passenger_name, passport, airline, origin, destination)
 
     @tool
     def get_profile() -> dict:
-        """Прочитать сохранённое имя пользователя приложения."""
-        return store.get_profile()
+        """Прочитать сохранённое имя пользователя и проверить доступность паспорта профиля."""
+        return read_profile()
+
+    @tool
+    def show_saved_passport() -> dict:
+        """Показать в чате полный номер вымышленного паспорта из локального профиля по явной просьбе пользователя. Для вопроса о наличии паспорта вызывай get_profile."""
+        profile = read_profile()
+        if profile.get("saved_document_available"):
+            return {"status": "ok", "name": profile["name"]}
+        return {"status": "not_found"}
 
     @tool
     def set_profile(name: str) -> dict:
@@ -343,7 +411,7 @@ def make_tools(store):
 
     @tool
     def list_bookings() -> dict:
-        """Показать активные брони локального пользователя без паспортных данных."""
+        """Показать активные брони пользователя со статусами рейсов и без паспортных данных."""
         return store.list_bookings()
 
     @tool
@@ -356,7 +424,7 @@ def make_tools(store):
         """Перенести бронь DEMO-NNNN на указанные рейс и дату YYYY-MM-DD."""
         return store.update_booking(booking_id, flight_number, flight_date)
 
-    return [flight_status, book_flight, search_flights, get_profile, set_profile, delete_profile, list_bookings, cancel_booking, update_booking]
+    return [flight_status, book_flight, search_flights, prepare_booking, clear_pending_booking, get_profile, show_saved_passport, set_profile, delete_profile, list_bookings, cancel_booking, update_booking]
 
 
 def create_agent(model, store=None):
@@ -365,40 +433,18 @@ def create_agent(model, store=None):
     tools = {t.name: t for t in make_tools(store)}
     bound_model = model.bind_tools(list(tools.values()))
 
-    def own_booking(messages):
-        for message in reversed(messages):
-            if isinstance(message, ToolMessage):
-                try:
-                    result = json.loads(message.content)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(result, dict) and result.get("status") in ("booked", "duplicate"):
-                    return False
-            if not isinstance(message, HumanMessage):
-                continue
-            text = str(message.content)
-            if re.fullmatch(r"(?i)\s*нет[.!?]?\s*", text) or re.search(r"(?i)(?:отмен[аяи]|не надо|не нужно|не\s+(?:брониру|заброниру|заводи|заводить)|стоп|передумал|для друга|паспорт друга|другого пассажира|на имя\s+\w+)", text):
-                return False
-            if re.search(r"(?i)(?:брон\w*|заброниру\w*).{0,60}(?:на меня|на себя|для меня|себе|мне)|(?:на меня|на себя|для меня|себе|мне).{0,60}(?:брон\w*|заброниру\w*)", text):
-                return True
-            if re.search(r"(?i)(?:брон\w*|заброниру\w*)", text) and not re.search(r"(?i)забронируешь", text):
-                return False
-            if not re.search(r"(?i)(?:PVT_[a-f0-9]{24}|ты же знаешь|вводил|завед[её]шь|забронируешь|подтверждаю|^\s*да[.!]?\s*$)", text):
-                return False
-        return False
-
-    def nearest_booking(messages):
-        human = next((str(m.content) for m in reversed(messages) if isinstance(m, HumanMessage)), "")
-        return bool(re.search(r"(?i)(?:брон\w*|заброниру\w*)", human) and re.search(r"(?i)ближайш", human))
-
     def call_model(state):
         history, removals = compact_history(state["messages"])
+        records = state["results"]
+        if any(r["tool"] == "prepare_booking" or r["tool"] == "book_flight" and r["result"].get("status") in ("booked", "duplicate") for r in records):
+            answer = prepare_answer({**state, "messages": []})
+            return {"messages": [*removals, AIMessage(content=json.dumps(answer, ensure_ascii=False))]}
         try:
             extra = []
-            is_own = own_booking(history)
-            profile = {}
-            has_passport = False
-            if is_own:
+            pending = state.get("pending_booking")
+            if pending:
+                extra.append(SystemMessage(content="Рейс для продолжения незавершённого бронирования: " + json.dumps(pending["flight"], ensure_ascii=False)))
+            if pending and pending["own"]:
                 profile = getattr(store, "get_profile", lambda: {})()
                 if profile.get("status") == "ok" and profile.get("name"):
                     has_passport = bool(getattr(store, "get_profile_passport", lambda name: "")(profile["name"]))
@@ -406,14 +452,14 @@ def create_agent(model, store=None):
             response = bound_model.invoke([SystemMessage(content=SYSTEM_PROMPT), *extra, *normalize_history(history)])
         except Exception as exc:
             info = diagnostic(exc, "model")
-            answer = prepare_answer({**state, "messages": [AIMessage(content='{}')]})
+            answer = prepare_answer({**state, "messages": []})
             if not state["results"]:
-                answer["message"] = "Не удалось получить ответ модели. " + info["action"]
+                answer["message"] = DATA_UNAVAILABLE
             answer["diagnostic"] = info
             return {"messages": [*removals, AIMessage(content=json.dumps(answer, ensure_ascii=False))]}
         # Ответ модели тоже может содержать паспорт, в том числе в аргументах.
         if response.invalid_tool_calls:
-            answer = prepare_answer({**state, "messages": [AIMessage(content="")]})
+            answer = prepare_answer({**state, "messages": []}) if records else invalid_response("invalid_tool_call")
             answer["diagnostic"] = invalid_response("invalid_tool_call")["diagnostic"]
             return {"messages": [*removals, AIMessage(content=json.dumps(answer, ensure_ascii=False))]}
         calls = []
@@ -425,7 +471,7 @@ def create_agent(model, store=None):
                     call["args"][key] = protect_args(value)
             if "passport" in call["args"]:
                 passport = call["args"]["passport"]
-                if isinstance(passport, str) and (passport in VAULT.get() or passport == "PVT_PROFILE" and own_booking(history)):
+                if isinstance(passport, str) and (passport in VAULT.get() or passport == "PVT_PROFILE"):
                     pass
                 elif isinstance(passport, str) and passport:
                     call["args"]["passport"] = "PVT_INVALID"
@@ -437,8 +483,7 @@ def create_agent(model, store=None):
         if calls:
             response = AIMessage(content="", tool_calls=calls, id=response.id)
         else:
-            answer = prepare_answer({**state, "messages": [response], "own_booking": is_own, "profile": profile, "profile_passport": has_passport,
-                                     "nearest_booking": nearest_booking(history)})
+            answer = prepare_answer({**state, "messages": [response]})
             response = AIMessage(content=json.dumps(answer, ensure_ascii=False), id=response.id)
         return {"messages": [*removals, response]}
 
@@ -450,10 +495,9 @@ def create_agent(model, store=None):
 
     def call_tools(state):
         messages, trace, results = [], list(state["trace"]), list(state["results"])
+        pending = state.get("pending_booking")
         for call in state["messages"][-1].tool_calls:
             name, args = call["name"], dict(call["args"])
-            if name == "search_flights" and nearest_booking(state["messages"]):
-                args.update(limit=1, from_now=True, available_only=True)
             executed = False
             recovered = None
             try:
@@ -463,22 +507,32 @@ def create_agent(model, store=None):
                     result = {"status": "error", "message": "Допускается один вызов бронирования за ход."}
                 else:
                     actual_args = dict(args)
+                    if name == "clear_pending_booking":
+                        pending = None
                     if name == "set_profile":
                         name_value = actual_args.get("name")
                         human = next((str(m.content) for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), "")
                         if not isinstance(name_value, str) or not name_value.strip() or " ".join(name_value.casefold().split()) not in " ".join(human.casefold().split()):
                             actual_args["name"] = ""
                     if name == "book_flight":
+                        own = actual_args.pop("own", False) is True
                         for key in FIELD_LABELS:
                             actual_args.setdefault(key, "")
+                        if pending:
+                            own = pending["own"]
+                            flight = pending["flight"]
+                            actual_args.update(flight_number=flight["flight_number"], flight_date=flight["departure"][:10], airline=flight.get("airline", ""), origin=flight.get("origin", ""), destination=flight.get("destination", ""))
+                            actual_args["passenger_name"] = actual_args.get("passenger_name") or pending.get("name", "")
                         name_value = actual_args.get("passenger_name")
                         human_text = " ".join(str(m.content) for m in state["messages"] if isinstance(m, HumanMessage))
-                        profile = store.get_profile() if own_booking(state["messages"]) else {}
+                        profile = store.get_profile() if own else {}
                         profile_name = profile.get("name", "") if profile.get("status") == "ok" else ""
                         if profile_name and (not name_value or name_value.casefold().strip() == profile_name.casefold().strip()):
                             actual_args["passenger_name"] = profile_name
-                        elif isinstance(name_value, str) and name_value.strip() and " ".join(name_value.casefold().split()) not in " ".join(human_text.casefold().split()):
+                        elif isinstance(name_value, str) and name_value.strip() and name_value != (pending or {}).get("name") and " ".join(name_value.casefold().split()) not in " ".join(human_text.casefold().split()):
                             actual_args["passenger_name"] = ""
+                        if pending and actual_args["passenger_name"]:
+                            pending = {**pending, "name": actual_args["passenger_name"]}
                     if name == "book_flight" and "passport" in actual_args:
                         marker = actual_args["passport"]
                         profile_authorized = bool(profile_name and actual_args.get("passenger_name", "").casefold().strip() == profile_name.casefold().strip())
@@ -496,6 +550,19 @@ def create_agent(model, store=None):
                                     result = store.book(actual_args["flight_number"], actual_args["flight_date"], actual_args["passenger_name"], actual_args["passport"], actual_args.get("airline", ""), actual_args.get("origin", ""), actual_args.get("destination", ""), remember_passport=True)
                                 else:
                                     result = tools[name].invoke(actual_args)
+                                if result.get("status") in ("booked", "duplicate") and own and profile.get("status") == "not_found":
+                                    try:
+                                        saved = store.set_profile(actual_args["passenger_name"])
+                                        if saved.get("status") != "ok" or not store.set_profile_passport(actual_args["passport"], saved["name"]):
+                                            raise ValueError("profile not saved")
+                                    except (Exception, KeyboardInterrupt):
+                                        profile_result = {"status": "error", "message": "Не удалось сохранить профиль."}
+                                        profile_record = {"tool": "set_profile", "result": profile_result, "executed": True}
+                                        results.append(profile_record)
+                                        trace.append(profile_record)
+                                        if JOURNAL.get() is not None:
+                                            JOURNAL.get()["results"].append(profile_record)
+                                            JOURNAL.get()["trace"].append(profile_record)
                             except (Exception, KeyboardInterrupt) as exc:
                                 # Вызов мог зафиксировать бронь до потери ответа.
                                 # Ищем её без повторного бронирования, пока паспорт в памяти.
@@ -517,10 +584,15 @@ def create_agent(model, store=None):
                 if recovered:
                     raise
                 if executed and name in ("book_flight", "cancel_booking", "update_booking"):
-                    result = {"status": "error", "message": "Результат операции неизвестен. Проверьте состояние броней перед повторной отправкой."}
+                    result = {"status": "error", "message": BOOKING_OUTCOME_UNKNOWN, "diagnostic": info}
                 else:
-                    result = {"status": "error", "message": "Не удалось выполнить инструмент. " + info["action"], "diagnostic": info}
+                    result = {"status": "error", "message": DATA_UNAVAILABLE, "diagnostic": info}
             safe_tool = name if name in TOOL_NAMES else "unknown"
+            if name == "prepare_booking" and executed:
+                flight = result.get("flight")
+                pending = {"flight": flight, "own": args.get("own") is True, "name": ""} if flight else None
+            if name == "book_flight" and result.get("status") in ("booked", "duplicate"):
+                pending = None
             journal = JOURNAL.get()
             if journal is not None and safe_tool == "book_flight" and isinstance(result, dict) and result.get("status") in ("booked", "duplicate"):
                 status = result["status"]
@@ -546,8 +618,9 @@ def create_agent(model, store=None):
             trace.append(item)
             if journal is not None:
                 journal["trace"][-1] = item
-            messages.append(ToolMessage(content=json.dumps(item["result"], ensure_ascii=False), tool_call_id=call["id"]))
-        return {"messages": messages, "trace": trace, "results": results, "rounds": state["rounds"] + 1}
+            model_result = {key: value for key, value in item["result"].items() if key != "diagnostic"}
+            messages.append(ToolMessage(content=json.dumps(model_result, ensure_ascii=False), tool_call_id=call["id"]))
+        return {"messages": messages, "trace": trace, "results": results, "rounds": state["rounds"] + 1, "pending_booking": pending}
 
     def limit(state):
         # Закрываем каждый ожидаемый вызов, чтобы история оставалась валидной.
@@ -584,30 +657,23 @@ def create_agent(model, store=None):
 
 
 def invalid_response(code):
-    return {"status": "error", "message": "Некорректный ответ модели. " + MODEL_RESPONSE_ACTION,
+    return {"status": "error", "message": DATA_UNAVAILABLE,
             "missing_fields": [], "alternatives": [],
             "diagnostic": {"source": "model", "category": "invalid_response", "code": code, "action": MODEL_RESPONSE_ACTION}}
 
 
-def search_conditions(args):
-    if args is None:
-        return "не сохранены"
-    args = safe_arguments(args)
-    parts = []
-    for key, label in (("origin", "откуда"), ("destination", "куда"), ("flight_date", "дата")):
-        if args.get(key):
-            parts.append(f"{label}: {json.dumps(args[key], ensure_ascii=False)}")
-    parts.append("только доступные: " + ("да" if args.get("available_only") is True else "нет"))
-    parts.append("с текущего времени: " + ("да" if args.get("from_now") is True else "нет"))
-    if "limit" in args:
-        parts.append(f"запрошенный лимит: {args['limit']}")
-    return ", ".join(parts)
+def search_label(number, args):
+    args = safe_arguments(args) if isinstance(args, dict) else {}
+    origin, destination, date = (" ".join(args.get(key, "").split()) for key in ("origin", "destination", "flight_date"))
+    route = f"{origin or 'любой город'} → {destination or 'любой город'}" if origin or destination else ""
+    details = ", ".join(filter(None, (route, date)))
+    return f"Поиск {number} ({details})" if details else f"Поиск {number}"
 
 
-def search_summary(result, args=None):
+def search_summary(result):
     if result.get("status") != "ok" or type(result.get("count")) is not int:
         return ""
-    message = f"Условия поиска: {search_conditions(args)}. По данным поиска найдено рейсов: {result['count']}."
+    message = f"По данным поиска найдено рейсов: {result['count']}."
     if result.get("truncated") and isinstance(result.get("flights"), list):
         message += f" Показаны первые {len(result['flights'])} из {result['count']}."
     return message
@@ -628,7 +694,38 @@ def tool_results(records):
              **({"arguments": r["arguments"]} if "arguments" in r else {})} for r in records]
 
 
+def parse_model_answer(content, *, has_results):
+    if isinstance(content, list):
+        content = "\n".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") in ("text", "output_text") and isinstance(block.get("text"), str))
+    content = content.strip() if isinstance(content, str) else ""
+    fenced = re.fullmatch(r'```(?:(?:json|text|markdown)\s*)?\n?(.*?)\n?```', content, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        content = fenced.group(1).strip()
+    if not content:
+        answer = invalid_response("empty_content")
+    else:
+        parsed_json = True
+        try:
+            parsed = json.loads(content)
+        except ValueError:
+            parsed = None
+            parsed_json = False
+        if isinstance(parsed, dict):
+            answer = {"status": parsed.get("status"), "message": parsed.get("message"), "missing_fields": parsed.get("missing_fields", []), "alternatives": []}
+            if parsed.get("booking_id") is not None and not has_results:
+                answer = invalid_response("invalid_format")
+            if answer["status"] not in ("ok", "error", "missing_fields", "booked", "duplicate", "not_found", "sold_out") or not isinstance(answer["message"], str) or not isinstance(answer["missing_fields"], list) or (answer["status"] == "ok" and not answer["message"].strip()):
+                answer = invalid_response("invalid_format")
+        elif parsed_json or content.startswith(('{', '[', '```')):
+            answer = invalid_response("invalid_format")
+        else:
+            answer = {"status": "ok", "message": content, "missing_fields": [], "alternatives": []}
+    return answer
+
+
 def prepare_answer(state):
+    has_model_reply = bool(state["messages"])
+    model_content = state["messages"][-1].content if has_model_reply else None
     records = state["results"]
     if any(r.get("tool") == "book_flight" and r.get("result", {}).get("message") != "Допускается один вызов бронирования за ход." for r in records):
         records = [r for r in records if not (r.get("tool") == "book_flight" and not r.get("executed") and r.get("result", {}).get("message") == "Допускается один вызов бронирования за ход.")]
@@ -641,6 +738,11 @@ def prepare_answer(state):
         answer["message"] = "\n".join(filter(None, [answer["message"], "Достигнут предел вызовов инструментов. Попробуйте уточнить запрос."]))
         answer["tool_results"] = tool_results(records)
         return redact(answer)
+    prepared = next((r["result"] for r in reversed(records) if r["tool"] == "prepare_booking" and r.get("executed", True)), None)
+    if prepared is not None and not any(r["tool"] == "book_flight" for r in records):
+        message = prepared_booking_message(prepared) or "Не удалось подготовить бронирование."
+        failures = [r["result"]["message"] for r in records if r["tool"] != "prepare_booking" and r["result"].get("status") == "error" and r["result"].get("message")]
+        return redact({**prepared, "message": "\n".join([message, *failures]), "alternatives": [], "tool_results": tool_results(records)})
     if len(records) > 1 and any(r.get("tool") in ("cancel_booking", "update_booking") for r in records):
         parts = [prepare_answer({**state, "results": [r]}) for r in records]
         return redact({**parts[-1], "message": "\n".join(p["message"] for p in parts),
@@ -662,7 +764,7 @@ def prepare_answer(state):
     # Поиск и просмотр должны оставлять естественный ответ модели в памяти и UI.
     # Структурированные утверждения об операциях без соответствующего вызова не принимаются.
     if records and all(r.get("executed", True) and r.get("result", {}).get("status") == "ok" and r.get("tool") in ("search_flights", "flight_status", "list_bookings") for r in records):
-        content = state["messages"][-1].content
+        content = model_content
         if isinstance(content, str):
             try:
                 parsed = json.loads(content)
@@ -673,31 +775,16 @@ def prepare_answer(state):
             else:
                 text = content if not content.lstrip().startswith(("{", "[", "```")) else ""
             # Не выдавать неподтверждённое завершение операции даже в свободном тексте.
-            if isinstance(text, str) and (text.strip() or any(r.get("tool") == "search_flights" for r in records)) and not re.search(r"(?i)(?:бронь|бронировани[ея]|билет).{0,45}(?:создан|подтвержд|оформлен|оплачен|отменен|отменён|перенес)|(?:забронирован|билет выписан)", text):
+            if isinstance(text, str) and text.strip() and not re.search(r"(?i)(?:бронь|бронировани[ея]|билет).{0,45}(?:создан|подтвержд|оформлен|оплачен|отменен|отменён|перенес)|(?:забронирован|билет выписан)", text):
                 result = records[-1]["result"]
                 searches = [r for r in records if r["tool"] == "search_flights"]
                 if searches:
                     nearest = len(searches) == 1 and searches[0].get("arguments", {}).get("limit") == 1 and searches[0].get("arguments", {}).get("from_now") is True and searches[0].get("arguments", {}).get("available_only") is True
-                    if nearest and state.get("nearest_booking") and searches[0]["result"].get("flights"):
-                        flight = searches[0]["result"]["flights"][0]
-                        selected = "Ближайший рейс: " + ", ".join(str(flight[k]).replace("T", " ") for k in ("flight_number", "origin", "destination", "departure") if flight.get(k)) + "."
-                        if "seats" in flight:
-                            selected += f" Свободных мест: {flight['seats']}."
-                        profile = state.get("profile", {})
-                        missing_name = not (state.get("own_booking") and profile.get("status") == "ok" and profile.get("name"))
-                        missing_passport = not (state.get("own_booking") and state.get("profile_passport"))
-                        fields = []
-                        if missing_name:
-                            fields.append("имя пассажира")
-                        if missing_passport:
-                            fields.append("10 цифр паспорта")
-                        text = " ".join([selected, "Пришлите " + " и ".join(fields) + "." if fields else "Подтвердите бронирование."])
-                        answer = {**result, "message": text, "missing_fields": [], "alternatives": [], "tool_results": tool_results(records)}
-                        return redact(answer)
                     text = "Нет подходящих рейсов." if nearest and searches[0]["result"].get("count") == 0 else search_clarifications(text)
-                    summaries = [search_summary(search["result"], search.get("arguments")) for search in searches]
+                    summaries = [search_summary(search["result"]) for search in searches]
                     if len(searches) > 1:
-                        summaries = [f"Поиск {i}: {summary}" for i, summary in enumerate(summaries, 1) if summary]
+                        summaries = [f"{search_label(i, search.get('arguments'))}: {summary}"
+                                     for i, (search, summary) in enumerate(zip(searches, summaries), 1) if summary]
                     text = "\n".join(filter(None, [text, *summaries]))
                 answer = {**result, "message": text.strip(), "missing_fields": [], "alternatives": [],
                           "tool_results": tool_results(records)}
@@ -715,49 +802,29 @@ def prepare_answer(state):
         return redact(answer)
     executed = [r for r in state["results"] if r.get("executed", True) and r.get("tool") in TOOL_NAMES]
     if len(executed) > 1:
-        parts = [prepare_answer({**state, "messages": [AIMessage(content="{}")], "results": [record], "rounds": 0}) for record in executed]
+        parts = [prepare_answer({**state, "messages": [], "results": [record], "rounds": 0}) for record in executed]
         booking_index = next((i for i, r in enumerate(executed) if r["tool"] == "book_flight" and r["result"].get("status") in ("booked", "duplicate")), None)
         if booking_index is None:
             booking_index = next((i for i, r in enumerate(executed) if r["tool"] == "book_flight"), len(parts) - 1)
         answer = dict(parts[booking_index])
         if executed[booking_index]["tool"] == "book_flight" and executed[booking_index]["result"].get("status") in ("booked", "duplicate"):
-            answer["message"] = parts[booking_index]["message"]
+            failures = [p["message"] for p in parts if p["status"] in ("error", "sold_out")]
+            answer["message"] = "\n".join([parts[booking_index]["message"], *failures])
         else:
             answer["message"] = "\n".join(f"{record['tool']}: {part['message']}" for record, part in zip(executed, parts))
-        if state["rounds"] >= MAX_TOOL_ROUNDS and state["messages"][-1].content and "Достигнут предел вызовов инструментов. Попробуйте уточнить запрос." in str(state["messages"][-1].content):
+        if state["rounds"] >= MAX_TOOL_ROUNDS and "Достигнут предел вызовов инструментов. Попробуйте уточнить запрос." in str(model_content):
             answer["message"] += "\nДостигнут предел вызовов инструментов. Попробуйте уточнить запрос."
             if not any(r["tool"] == "book_flight" for r in executed):
                 answer["status"] = "error"
+        response_diagnostic = parse_model_answer(model_content, has_results=True).get("diagnostic") if has_model_reply else None
+        info = answer.get("diagnostic") or next((p["diagnostic"] for p in parts if "diagnostic" in p), None) or response_diagnostic
+        if info:
+            answer["diagnostic"] = info
         answer["tool_results"] = tool_results(executed)
         return redact(answer)
     if executed:
         state = {**state, "results": executed}
-    content = state["messages"][-1].content
-    if isinstance(content, list):
-        content = "\n".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") in ("text", "output_text") and isinstance(block.get("text"), str))
-    content = content.strip() if isinstance(content, str) else ""
-    fenced = re.fullmatch(r'```(?:(?:json|text|markdown)\s*)?\n?(.*?)\n?```', content, re.DOTALL | re.IGNORECASE)
-    if fenced:
-        content = fenced.group(1).strip()
-    if not content:
-        answer = invalid_response("empty_content")
-    else:
-        parsed_json = True
-        try:
-            parsed = json.loads(content)
-        except ValueError:
-            parsed = None
-            parsed_json = False
-        if isinstance(parsed, dict):
-            answer = {"status": parsed.get("status"), "message": parsed.get("message"), "missing_fields": parsed.get("missing_fields", []), "alternatives": []}
-            if parsed.get("booking_id") is not None and not state["results"]:
-                answer = invalid_response("invalid_format")
-            if answer["status"] not in ("ok", "error", "missing_fields", "booked", "duplicate", "not_found", "sold_out") or not isinstance(answer["message"], str) or not isinstance(answer["missing_fields"], list) or (answer["status"] == "ok" and not answer["message"].strip()):
-                answer = invalid_response("invalid_format")
-        elif parsed_json or content.startswith(('{', '[', '```')):
-            answer = invalid_response("invalid_format")
-        else:
-            answer = {"status": "ok", "message": content, "missing_fields": [], "alternatives": []}
+    answer = parse_model_answer(model_content, has_results=bool(records)) if has_model_reply else {"status": "error", "message": "", "missing_fields": [], "alternatives": []}
     response_diagnostic = answer.get("diagnostic")
     # Бронь подтверждается только фактическим результатом инструмента в этом ходе.
     booking = next((r["result"] for r in state["results"] if r["tool"] == "book_flight" and r["result"].get("status") in ("booked", "duplicate")), None)
@@ -771,6 +838,11 @@ def prepare_answer(state):
         result = state["results"][-1]["result"]
         if state["results"][-1]["tool"] in ("get_profile", "set_profile") and result.get("status") == "ok" and result.get("name"):
             message = ("Ваше имя: " if state["results"][-1]["tool"] == "get_profile" else "Имя сохранено: ") + result["name"] + "."
+        elif state["results"][-1]["tool"] == "show_saved_passport" and result.get("status") in ("ok", "not_found"):
+            message = "В профиле сохранён паспорт." if result["status"] == "ok" else SAVED_PASSPORT_MISSING
+        elif state["results"][-1]["tool"] == "list_bookings" and result.get("status") == "ok":
+            bookings = result.get("bookings", [])
+            message = "Активные брони: " + ", ".join(b["booking_id"] for b in bookings if b.get("booking_id")) + "." if bookings else "Активных броней нет."
         elif result.get("status") == "ok" and isinstance(result.get("flight"), dict):
             flight = result["flight"]
             parts = []
@@ -786,7 +858,7 @@ def prepare_answer(state):
         else:
             message = result.get("message", "Не удалось получить данные рейса.")
         if state["results"][-1]["tool"] == "search_flights" and result.get("status") == "ok":
-            summary = search_summary(result, state["results"][-1].get("arguments"))
+            summary = search_summary(result)
             if summary:
                 message += " " + summary
         answer = {"status": result.get("status", "error"), "message": message, "missing_fields": result.get("missing_fields", []), "alternatives": result.get("alternatives", [])}
@@ -817,7 +889,7 @@ def prepare_answer(state):
         labels = [FIELD_LABELS[field] for field in answer["missing_fields"] if isinstance(field, str) and field in FIELD_LABELS]
         if labels and (not answer.get("message", "").strip() or answer.get("message") == "Укажите недостающие данные."):
             answer["message"] = "Укажите недостающие данные: " + ", ".join(labels) + "."
-    if response_diagnostic and state["results"] and "diagnostic" not in answer:
+    if response_diagnostic and state["results"] and not booking and "diagnostic" not in answer:
         answer["diagnostic"] = response_diagnostic
     return redact(answer)
 
@@ -848,13 +920,13 @@ def respond(graph, text, thread_id="cli"):
         except KeyboardInterrupt:
             if not journal["results"]:
                 raise
-            answer = prepare_answer({"messages": [AIMessage(content="{}")], "results": journal["results"], "rounds": 0})
+            answer = prepare_answer({"messages": [], "results": journal["results"], "rounds": 0})
             answer["_interrupted"] = True
             return answer, journal["trace"]
         except Exception as exc:
             answer = error_answer(exc, "application")
             if journal["results"]:
-                answer = prepare_answer({"messages": [AIMessage(content="{}")], "results": journal["results"], "rounds": 0})
+                answer = prepare_answer({"messages": [], "results": journal["results"], "rounds": 0})
                 answer["diagnostic"] = diagnostic(exc, "application")
             return answer, journal["trace"]
     finally:

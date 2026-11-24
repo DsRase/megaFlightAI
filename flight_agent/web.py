@@ -1,5 +1,7 @@
+import logging
 import os
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,14 +15,16 @@ from pydantic import BaseModel, StrictStr
 
 from . import BASE_URL, MODEL
 from .__main__ import format_result
-from .agent import MAX_MESSAGE_CHARS, create_agent, respond
+from .agent import MAX_MESSAGE_CHARS, TOOL_NAMES, create_agent, respond, safe_result
 from .data import FlightStore
+from .diagnostics import BOOKING_OUTCOME_UNKNOWN, diagnostic
 
 
 STATIC = Path(__file__).resolve().parent / "static"
 ALLOWED_HOSTS = {"localhost:8080", "127.0.0.1:8080"}
 ALLOWED_ORIGINS = {"http://" + host for host in ALLOWED_HOSTS}
 LOCK_TIMEOUT = 5
+CHAT_LOG = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -41,6 +45,7 @@ async def lifespan(app):
     except Exception:
         raise RuntimeError("Не удалось запустить приложение.") from None
     try:
+        app.state.store = store
         app.state.lock = threading.Lock()
         app.state.thread_id = str(uuid.uuid4())
         yield
@@ -53,13 +58,49 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.middleware("http")
 async def local_requests_only(request: Request, call_next):
+    chat_request = request.method == "POST" and request.scope["path"] == "/api/chat"
+    if chat_request:
+        request_id = uuid.uuid4().hex
+        started = time.monotonic()
+        CHAT_LOG.info("chat started request_id=%s", request_id)
     hosts = request.headers.getlist("host")
     origins = request.headers.getlist("origin")
     if len(hosts) != 1 or hosts[0].lower() not in ALLOWED_HOSTS or (
         origins and (len(origins) != 1 or origins[0].lower() not in ALLOWED_ORIGINS)
     ):
-        return JSONResponse({"reply": "Запрос отклонён."}, status_code=403)
-    return await call_next(request)
+        response = JSONResponse({"reply": "Запрос отклонён."}, status_code=403)
+    else:
+        response = await call_next(request)
+    if chat_request:
+        status = getattr(request.state, "chat_status", "-")
+        tool_statuses = getattr(request.state, "chat_tools", [])
+        diagnostics = getattr(request.state, "chat_diagnostics", [])
+        CHAT_LOG.log(
+            logging.WARNING if diagnostics else logging.INFO,
+            "chat completed request_id=%s response_http_status=%d result_status=%s elapsed_ms=%.0f tools=%s diagnostics=%s",
+            request_id, response.status_code, status, (time.monotonic() - started) * 1000, tool_statuses, diagnostics,
+        )
+    return response
+
+
+def record_chat_result(state, answer, trace):
+    state.chat_tools = []
+    state.chat_diagnostics = []
+    records = [(None, answer)]
+    records.extend((item.get("tool", "unknown"), item.get("result")) for item in (trace or []))
+    for tool, result in records:
+        if not isinstance(result, dict):
+            continue
+        checked = safe_result({key: result.get(key) for key in ("status", "diagnostic")})
+        status = checked.get("status", "-")
+        if tool is None:
+            state.chat_status = status
+        else:
+            state.chat_tools.append(f"{tool if tool in TOOL_NAMES else 'unknown'}:{status}")
+        info = checked.get("diagnostic", {})
+        info = {key: info[key] for key in ("source", "category", "code", "http_status") if key in info}
+        if info and info not in state.chat_diagnostics:
+            state.chat_diagnostics.append(info)
 
 
 class ChatRequest(BaseModel):
@@ -87,7 +128,7 @@ def styles():
 
 
 @app.post("/api/chat")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, http_request: Request):
     if not request.message.strip():
         return JSONResponse({"reply": "Введите сообщение."}, status_code=400)
     if len(request.message) > MAX_MESSAGE_CHARS:
@@ -97,12 +138,18 @@ def chat(request: ChatRequest):
             return JSONResponse({"reply": "Приложение занято. Попробуйте ещё раз."}, status_code=503)
         try:
             answer, trace = respond(app.state.graph, request.message, app.state.thread_id)
-            reply = format_result(answer, trace)
+            record_chat_result(http_request.state, answer, trace)
+            reply = format_result(answer, trace, app.state.store)
         finally:
             app.state.lock.release()
         return {"reply": reply}
-    except Exception:
-        return JSONResponse({"reply": "Не удалось получить результат. Проверьте состояние броней перед повторной отправкой."}, status_code=500)
+    except Exception as exc:
+        http_request.state.chat_status = "error"
+        diagnostics = getattr(http_request.state, "chat_diagnostics", [])
+        info = diagnostic(exc, "application")
+        info.pop("action")
+        http_request.state.chat_diagnostics = [*diagnostics, info]
+        return JSONResponse({"reply": BOOKING_OUTCOME_UNKNOWN}, status_code=500)
 
 
 @app.post("/api/chat/clear")

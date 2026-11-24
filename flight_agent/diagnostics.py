@@ -1,6 +1,11 @@
 """Безопасные сообщения об ошибках без текста исключений и данных запроса."""
 
 import openai
+from pydantic import ValidationError
+
+
+DATA_UNAVAILABLE = "Данные сейчас недоступны."
+BOOKING_OUTCOME_UNKNOWN = "Результат операции неизвестен. Проверьте состояние броней перед повторной отправкой."
 
 
 def diagnostic(exc, source):
@@ -24,7 +29,7 @@ def diagnostic(exc, source):
     result = {"source": source, "category": category, "action": action}
     if category == "unexpected":
         # Только фиксированный список встроенных типов, без имён пользовательских классов.
-        result["code"] = next((name for cls, name in (
+        result["code"] = "invalid_tool_arguments" if source == "tool" and isinstance(exc, ValidationError) else next((name for cls, name in (
             (ValueError, "value_error"), (TypeError, "type_error"),
             (KeyError, "key_error"), (RuntimeError, "runtime_error"),
             (OSError, "os_error"),
@@ -36,5 +41,5 @@ def diagnostic(exc, source):
 
 def error_answer(exc, source):
     info = diagnostic(exc, source)
-    return {"status": "error", "message": "Не удалось обработать запрос. " + info["action"],
+    return {"status": "error", "message": DATA_UNAVAILABLE,
             "missing_fields": [], "alternatives": [], "diagnostic": info}

@@ -40,13 +40,6 @@ async function serverReply(response) {
   return data.reply;
 }
 
-function maskPassports(text) {
-  return text
-    .replace(/(?<![\p{L}\p{N}_])((?:паспорт(?:а|у|ом)?|passport)(?![\p{L}\p{N}_])\s*[":=№#-]*\s*)(?!\d{4}-\d{2}-\d{2}(?![\p{L}\p{N}_]))([0-9]+(?:[ /-]+[0-9]+)*|[A-Za-z]+(?:\/[A-Za-z0-9]+|[0-9][A-Za-z0-9]*)+)(?![\p{L}\p{N}_-])/giu, '$1***')
-    .replace(/(?<![\p{L}\p{N}_-])(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d{10})[A-Za-z0-9]+(?![\p{L}\p{N}_-])/gu, '***')
-    .replace(/(?<![\p{L}\p{N}_-])(?:\d{10,}|\d{4}[ -]+\d{6}|\d{2}[ -]+\d{2}[ -]+\d{6})(?![\p{L}\p{N}_-])/gu, '***');
-}
-
 function setPending(value) {
   pending = value;
   sendButton.disabled = value;
@@ -117,7 +110,7 @@ form.addEventListener('submit', async (event) => {
   setPending(true);
   error.hidden = true;
   error.textContent = '';
-  addMessage(maskPassports(message), true);
+  addMessage(message, true);
   input.value = '';
   resizeInput();
   const thinking = addMessage(thoughts[Math.floor(Math.random() * thoughts.length)]);

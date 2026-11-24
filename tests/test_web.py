@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -50,7 +51,7 @@ def test_validation_does_not_echo_input(client, body):
     assert set(response.json()) == {"reply"}
 
 
-def test_empty_and_safe_error(client, monkeypatch):
+def test_empty_and_safe_error(client, monkeypatch, caplog):
     http, _ = client
     assert http.post("/api/chat", json={"message": "  "}).status_code == 400
 
@@ -61,14 +62,43 @@ def test_empty_and_safe_error(client, monkeypatch):
     response = http.post("/api/chat", json={"message": "hello"})
     assert response.status_code == 500
     assert "secret" not in response.text and "1234567890" not in response.text
+    assert "response_http_status=500 result_status=error" in caplog.text
+    assert "'source': 'application', 'category': 'unexpected', 'code': 'runtime_error'" in caplog.text
+    assert all(value not in caplog.text for value in ("secret", "1234567890", "hello"))
 
 
-def test_tool_result_uses_cli_format(client, monkeypatch):
+def test_tool_result_uses_cli_format(client, monkeypatch, caplog):
     http, _ = client
+    caplog.set_level(logging.INFO, logger="uvicorn.error")
     result = {"status": "ok", "count": 1, "flights": [{"flight_number": "SU123", "origin": "Москва", "destination": "Казань", "seats": 3}]}
     monkeypatch.setattr(web, "respond", lambda *args: ({"status": "ok", "message": "Поиск выполнен."}, [{"tool": "search_flights", "result": result}]))
     reply = http.post("/api/chat", json={"message": "Рейсы"}).json()["reply"]
     assert "Найдено рейсов: 1" in reply and "SU123" in reply and "свободных мест: 3" in reply
+    started, completed = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error"]
+    assert started.split("request_id=")[1] == completed.split("request_id=")[1].split()[0]
+    assert "response_http_status=200 result_status=ok elapsed_ms=" in completed
+    assert "tools=['search_flights:ok'] diagnostics=[]" in completed
+    assert all(value not in completed for value in ("Рейсы", "Поиск выполнен", "SU123", "Москва"))
+
+
+def test_agent_diagnostic_logged_with_successful_http_response(client, monkeypatch, caplog):
+    http, _ = client
+    diagnostic = {"source": "model", "category": "rate_limit", "http_status": 429, "action": "private detail"}
+    answer = {"status": "ok", "message": "Готово", "diagnostic": diagnostic}
+    trace = [
+        {"tool": "private tool", "arguments": {"name": "Иван"}, "result": {"status": "private status"}},
+        {"tool": "search_flights", "result": {"status": "error", "diagnostic": {
+            "source": "tool", "category": "unexpected", "code": "runtime_error",
+        }}},
+    ]
+    monkeypatch.setattr(web, "respond", lambda *args: (answer, trace))
+    monkeypatch.setattr(web, "format_result", lambda *args: "Готово")
+    assert http.post("/api/chat", json={"message": "Введите 0123456789"}).status_code == 200
+    assert "response_http_status=200 result_status=ok" in caplog.text
+    assert "tools=['unknown:-', 'search_flights:error']" in caplog.text
+    assert "'source': 'model', 'category': 'rate_limit', 'http_status': 429" in caplog.text
+    assert "'source': 'tool', 'category': 'unexpected', 'code': 'runtime_error'" in caplog.text
+    assert all(value not in caplog.text for value in ("private", "Иван", "0123456789", "Готово"))
 
 
 def test_requests_are_serialized(client, monkeypatch):
@@ -152,6 +182,32 @@ def test_profile_results_through_web(client, monkeypatch):
         assert replies == ["Имя сохранено: Иван.", "Ваше имя: Иван.", "Профиль удалён.", "Имя пользователя не сохранено."]
     finally:
         store.close()
+
+
+def test_chat_shows_saved_passport_only_on_request(client, monkeypatch):
+    http, model = client
+    store = web.app.state.store
+    passport = "0123456789"
+    store.set_profile("Иван")
+    assert store.set_profile_passport(passport, "Иван")
+    responses = iter([
+        AIMessage(content="", tool_calls=[{"name": "show_saved_passport", "args": {}, "id": "show"}]),
+        AIMessage(content="Готово."),
+        AIMessage(content='{"status":"ok","message":"Здравствуйте!","missing_fields":[],"display_saved_passport":"Иван"}'),
+    ])
+
+    def invoke(messages):
+        model.contexts.append(messages)
+        return next(responses)
+
+    monkeypatch.setattr(model, "invoke", invoke)
+    reply = http.post("/api/chat", json={"message": "Покажи номер моего паспорта"}).json()["reply"]
+    assert passport in reply
+    reply = http.post("/api/chat", json={"message": "Привет"}).json()["reply"]
+    assert reply == "Здравствуйте!"
+    assert all(passport not in str(messages) for messages in model.contexts)
+    config = {"configurable": {"thread_id": web.app.state.thread_id}}
+    assert all(passport not in repr(checkpoint) for checkpoint in web.app.state.graph.checkpointer.list(config))
 
 
 def test_clear_changes_thread_and_preserves_database(client):

@@ -68,7 +68,7 @@ def test_invalid_model_response_has_specific_diagnostic(content, code, capsys):
     assert "private reasoning" not in str(answer)
     print_result(answer, trace)
     output = capsys.readouterr().out
-    assert "Не удалось получить понятный ответ." in output
+    assert output.strip() == "Данные сейчас недоступны."
     assert "invalid_response" not in output
 
 

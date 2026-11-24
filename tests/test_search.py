@@ -134,32 +134,49 @@ def test_untrusted_search_claims_and_same_sentence_question():
         assert f"рейсов: {trace[0]['result']['count']}" in answer["message"]
 
 
-def test_multiple_searches_preserve_conditions_and_corresponding_results():
+def test_multiple_searches_show_each_result_without_technical_filters(monkeypatch):
+    from datetime import datetime
     from flight_agent.__main__ import format_result
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2027, 6, 12, 10, 0, tzinfo=tz)
+
+    monkeypatch.setattr("flight_agent.data.datetime", Clock)
+    arguments = [
+        {"origin": "Москва", "destination": "Санкт-Петербург", "flight_date": "2027-06-12", "available_only": True, "limit": 1},
+        {"origin": "Сочи", "destination": "Москва", "from_now": True},
+    ]
 
     class TwoSearches(SearchModel):
         def invoke(self, messages):
             self.contexts.append(messages)
             if len(self.contexts) == 1:
                 return AIMessage(content="", tool_calls=[
-                    {"name": "search_flights", "args": {"origin": "Москва", "destination": "Казань", "flight_date": "2027-06-10", "available_only": True, "limit": 2}, "id": "a", "type": "tool_call"},
-                    {"name": "search_flights", "args": {"origin": "Сочи", "destination": "Москва", "from_now": True}, "id": "b", "type": "tool_call"},
+                    {"name": "search_flights", "args": args, "id": f"search-{index}", "type": "tool_call"}
+                    for index, args in enumerate(arguments, 1)
                 ])
             return AIMessage(content="Найдено пять рейсов — на какую дату искать?")
 
     answer, trace = respond(create_agent(TwoSearches({}, "")), "Найди рейсы")
-    assert len(trace) == 2
-    assert [r["arguments"] for r in answer["tool_results"]] == [r["arguments"] for r in trace]
-    first, second = answer["message"].split("Поиск 1:")[1].split("Поиск 2:")
-    assert 'куда: "Казань"' in first and "2027-06-10" in first and "только доступные: да" in first and "лимит: 2" in first
-    assert 'откуда: "Сочи"' in second and "с текущего времени: да" in second
-    assert f"рейсов: {trace[0]['result']['count']}" in first
-    assert f"рейсов: {trace[1]['result']['count']}" in second
+    assert [r["arguments"] for r in answer["tool_results"]] == [r["arguments"] for r in trace] == arguments
+    assert [r["result"] for r in answer["tool_results"]] == [r["result"] for r in trace]
+    first_label = "Поиск 1 (Москва → Санкт-Петербург, 2027-06-12)"
+    second_label = "Поиск 2 (Сочи → Москва)"
+    first, second = answer["message"].split(first_label)[1].split(second_label)
+    assert "рейсов: 2." in first and "Показаны первые 1 из 2." in first
+    assert f"рейсов: {trace[1]['result']['count']}." in second
     output = format_result(answer, trace)
-    assert 'куда: "Казань"' in output and 'откуда: "Сочи"' in output
+    first, second = output.split(first_label)[1].split(second_label)
+    assert "Рейс SU123" in first and "Показано: 1." in first
+    assert "Рейс SU202" in second
+    for text in (answer["message"], output):
+        assert "на какую дату искать?" in text
+        assert all(label not in text for label in ("Условия поиска", "только доступные", "с текущего времени", "запрошенный лимит"))
 
 
-def test_search_conditions_redact_sensitive_arguments():
+def test_search_trace_redacts_sensitive_arguments():
     model = SearchModel({"destination": "паспорт 1234567890", "limit": 2}, "Укажите имя пассажира и паспорт.")
     answer, trace = respond(create_agent(model), "Найди рейсы")
     assert "1234567890" not in json.dumps([answer, trace], ensure_ascii=False)

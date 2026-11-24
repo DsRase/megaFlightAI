@@ -3,7 +3,6 @@ import threading
 from contextlib import nullcontext
 
 import pytest
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from flight_agent import __main__ as cli
 from flight_agent.data import FLIGHTS
@@ -88,7 +87,7 @@ def test_non_tty_fallback_and_safe_error_before_next_trace(monkeypatch, capsys, 
     captured = capsys.readouterr()
     assert captured.err == ""
     assert "\r" not in captured.err
-    assert "Не удалось обработать запрос" in captured.out
+    assert "Данные сейчас недоступны." in captured.out
     assert "Диагностика:" not in captured.out and "Инструменты:" not in captured.out
     assert "secret" not in captured.out + captured.err
     assert "1234567890" not in captured.out + captured.err
@@ -161,22 +160,7 @@ def test_common_markdown_cleanup():
 def test_unconfirmed_booking_is_not_presented_as_success(capsys):
     cli.print_result({"status": "booked", "message": "Демобронь создана.", "booking_id": "DEMO-0001"}, [])
     output = capsys.readouterr().out
-    assert "Не удалось подтвердить" in output and "DEMO-0001" not in output
-
-
-def test_plain_text_instruction_is_added_without_modifying_history():
-    class Model:
-        def bind_tools(self, tools):
-            return self
-
-        def invoke(self, messages):
-            return messages
-
-    original = [SystemMessage(content="Системные правила"), HumanMessage(content="Привет")]
-    messages = cli.PlainTextModel(Model()).bind_tools([]).invoke(original)
-    assert "без Markdown" in messages[0].content
-    assert original[0].content == "Системные правила"
-    assert messages[1] is original[1]
+    assert "Проверьте состояние броней" in output and "DEMO-0001" not in output
 
 
 def test_booking_remains_visible_when_a_later_request_fails(capsys):
@@ -185,7 +169,17 @@ def test_booking_remains_visible_when_a_later_request_fails(capsys):
     cli.print_result(answer, [{"tool": "book_flight", "executed": True, "result": result}])
     output = capsys.readouterr().out
     assert "Бронь создана" in output and "DEMO-0001" in output
-    assert "Не удалось полностью обработать запрос" in output and "Проверьте подключение" in output
+    assert "Не удалось полностью обработать запрос" not in output and "Проверьте подключение" not in output
+
+
+def test_unknown_booking_outcome_still_warns_before_retry():
+    result = {
+        "status": "error",
+        "message": "Результат операции неизвестен. Проверьте состояние броней перед повторной отправкой.",
+        "diagnostic": {"source": "tool", "category": "unexpected", "code": "runtime_error"},
+    }
+    trace = [{"tool": "book_flight", "executed": True, "result": result}]
+    assert cli.format_result(result, trace) == result["message"]
 
 
 def test_profile_results_through_cli(monkeypatch, capsys, tmp_path):

@@ -89,7 +89,7 @@ def test_memory_and_context():
 
 
 def test_duplicate_and_masking():
-    model = ScriptedModel([call("book_flight", BOOK_ARGS), final("booked", "Бронь создана"), call("book_flight", BOOK_ARGS), final("duplicate", "Бронь уже существует")])
+    model = ScriptedModel([call("book_flight", BOOK_ARGS), call("book_flight", BOOK_ARGS)])
     graph = create_agent(model)
     first, _ = respond(graph, "Бронь Иван Тестов паспорт 1234567890")
     second, trace = respond(graph, "Повторить паспорт 1234567890")
@@ -492,8 +492,12 @@ def test_incomplete_booking_result_keeps_diagnostic():
 
 
 def test_limit_rejection_keeps_booking_and_safe_trace():
-    replies = [call("book_flight", BOOK_ARGS)] + [call("flight_status", STATUS_ARGS) for _ in range(3)]
-    replies.append(call("book_flight", {**BOOK_ARGS, "passenger_name": "AB1234567890"}))
+    replies = [call("flight_status", STATUS_ARGS) for _ in range(3)]
+    calls = [
+        {"name": "book_flight", "args": BOOK_ARGS, "id": "booking", "type": "tool_call"},
+        {"name": "book_flight", "args": {**BOOK_ARGS, "passenger_name": "AB1234567890"}, "id": "rejected", "type": "tool_call"},
+    ]
+    replies.append(AIMessage(content="", tool_calls=calls))
     answer, trace = respond(create_agent(ScriptedModel(replies)), "Бронь Иван Тестов паспорт 1234567890")
     assert answer["status"] == "error" and answer["booking_id"] == "DEMO-0001"
     assert "Достигнут предел вызовов инструментов." in answer["message"]
@@ -572,13 +576,15 @@ def test_interrupted_tool_call_is_closed_before_next_model_request(monkeypatch):
     assert messages[index + 1].tool_call_id == messages[index].tool_calls[0]["id"]
 
 
-def test_cli_marks_limit_rejection_as_not_executed(capsys):
+def test_cli_keeps_results_without_displaying_limit_rejection(capsys):
     from flight_agent.__main__ import print_result
     replies = [call("flight_status", STATUS_ARGS) for _ in range(5)]
     answer, trace = respond(create_agent(ScriptedModel(replies)), "Статус")
     print_result(answer, trace)
     assert trace[-1]["executed"] is False
-    assert "Достигнут предел вызовов инструментов." in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "SU123" in output
+    assert "Достигнут предел вызовов инструментов." not in output
 
 
 @pytest.mark.parametrize("missing", list(BOOK_ARGS))
@@ -669,14 +675,14 @@ def test_passport_resubmission_natural_text_is_not_eaten():
     assert redact("Пожалуйста, введите паспорт повторно для бронирования.") == "Пожалуйста, введите паспорт повторно для бронирования."
 
 
-def test_interrupt_after_booking_returns_journal():
-    class InterruptedModel(ScriptedModel):
-        def invoke(self, messages):
-            if messages[-1].type == "tool":
-                raise KeyboardInterrupt
-            return super().invoke(messages)
+def test_interrupt_after_booking_returns_journal(monkeypatch):
+    from flight_agent import agent
 
-    answer, trace = respond(create_agent(InterruptedModel([call("book_flight", BOOK_ARGS)])), "Иван Тестов паспорт 1234567890")
+    def interrupt(*args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(agent, "safe_trace_item", interrupt)
+    answer, trace = respond(create_agent(ScriptedModel([call("book_flight", BOOK_ARGS)])), "Иван Тестов паспорт 1234567890")
     assert answer["_interrupted"] is True
     assert answer["status"] == "booked" and answer["booking_id"] == "DEMO-0001"
     assert trace[0]["result"]["status"] == "booked"
@@ -736,10 +742,8 @@ def test_multiple_tool_results_are_preserved_and_presented(booking_first, capsys
     model = ScriptedModel([AIMessage(content="", tool_calls=calls), final("ok", "Выдуманный результат")])
     answer, trace = respond(create_agent(model), "Иван Тестов паспорт 1234567890")
     assert answer["status"] == "booked" and answer["booking_id"] == "DEMO-0001"
-    assert answer["tool_results"] == [{"tool": item["tool"], "result": item["result"]} for item in trace]
-    assert all(item["tool"] in answer["message"] for item in trace)
-    search = next(item["result"] for item in trace if item["tool"] == "search_flights")
-    assert str(search["count"]) in answer["message"]
+    assert answer["tool_results"] == [{key: item[key] for key in ("tool", "result", "arguments")} for item in trace]
+    assert answer["message"] == "Бронь создана."
     print_result(answer, trace)
     output = capsys.readouterr().out
     assert '"tool_results"' not in output and '"flights"' not in output and "DEMO-0001" in output
@@ -776,7 +780,7 @@ def test_counts_remain_readable_while_passports_are_protected():
 
 
 @pytest.mark.parametrize("tool,args,reason", [
-    ("unknown_tool", {}, "Неизвестный инструмент."),
+    ("unknown_tool", {}, "Данные сейчас недоступны."),
     ("book_flight", {**BOOK_ARGS, "passport": "PVT_forged"}, "Укажите паспорт повторно: данные предыдущего хода не сохраняются."),
 ])
 def test_cli_shows_reason_when_only_tool_calls_are_rejected(tool, args, reason, capsys):

@@ -45,12 +45,12 @@ test('theme preference persists and server errors are displayed safely', async (
   assert.equal(ids.error.textContent, 'Приложение занято.');
 });
 
-test('shows user text safely while masking passport values', async () => {
+test('shows user text safely and unchanged', async () => {
   const ids = browser(async () => ({ok: true, json: async () => ({reply: 'Готово'})}));
   ids['message-input'].value = '  <b>Привет</b>! Паспорт: 1234 567890, рейс SU123.  ';
   await ids['chat-form'].listeners.submit({preventDefault() {}});
   const userText = ids.messages.children[0].children[0].children[1].textContent;
-  assert.equal(userText, '  <b>Привет</b>! Паспорт: ***, рейс SU123.  ');
+  assert.equal(userText, '  <b>Привет</b>! Паспорт: 1234 567890, рейс SU123.  ');
 });
 
 test('keeps flight details and ordinary passport questions readable', async () => {
@@ -58,14 +58,14 @@ test('keeps flight details and ordinary passport questions readable', async () =
   const message = 'Рейс SU202 2027-06-01 12:40, 220 рейсов, 123 места. Паспортные данные: а паспорт какой? passport please, паспорт 2027-06-12, предпаспорт 987, паспортный 987. 1234567890';
   ids['message-input'].value = message;
   await ids['chat-form'].listeners.submit({preventDefault() {}});
-  assert.equal(ids.messages.children[0].children[0].children[1].textContent, message.replace('1234567890', '***'));
+  assert.equal(ids.messages.children[0].children[0].children[1].textContent, message);
 });
 
-test('masks labeled invalid values and separated passport numbers', async () => {
+test('shows labeled values and separated passport numbers unchanged', async () => {
   const ids = browser(async () => ({ok: true, json: async () => ({reply: 'Готово'})}));
   ids['message-input'].value = 'паспорт 987, passport ABC/DEF, паспорт 1234 567890, паспорт 12 34 567890';
   await ids['chat-form'].listeners.submit({preventDefault() {}});
-  assert.equal(ids.messages.children[0].children[0].children[1].textContent, 'паспорт ***, passport ***, паспорт ***, паспорт ***');
+  assert.equal(ids.messages.children[0].children[0].children[1].textContent, 'паспорт 987, passport ABC/DEF, паспорт 1234 567890, паспорт 12 34 567890');
 });
 
 test('clear waits for active requests and clears history only on success', async () => {
@@ -109,7 +109,7 @@ function contents(element) {
 }
 
 for (const failure of [false, true]) {
-  test(`passport is absent from DOM and input after ${failure ? 'failure' : 'success'}`, async () => {
+  test(`passport stays in the user message and input is cleared after ${failure ? 'failure' : 'success'}`, async () => {
     let sent;
     const ids = browser(async (_url, options) => {
       sent = JSON.parse(options.body).message;
@@ -121,7 +121,8 @@ for (const failure of [false, true]) {
     await ids['chat-form'].listeners.submit({preventDefault() {}});
     assert.equal(sent, 'Паспорт 1234567890');
     assert.equal(ids['message-input'].value, '');
-    assert.doesNotMatch(contents(ids.messages) + contents(ids.error), /1234567890/);
+    assert.equal(ids.messages.children[0].children[0].children[1].textContent, 'Паспорт 1234567890');
+    assert.doesNotMatch(contents(ids.error), /1234567890/);
     assert.equal(ids['send-button'].disabled, false);
   });
 }

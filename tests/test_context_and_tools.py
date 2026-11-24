@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from flight_agent.agent import compact_history, create_agent, respond, safe_result
@@ -26,19 +27,43 @@ def call(name, args, ident="call-1"):
 
 
 def test_search_answer_and_selection_survive_next_turn():
-    text = "Ближайший доступный рейс SU202, 2027-06-01. Укажите имя пассажира и паспорт."
-    model = Model([call("search_flights", {"origin": "Сочи", "destination": "Москва", "available_only": True, "from_now": True, "limit": 1}),
-                   AIMessage(content=text), AIMessage(content="Укажите паспорт.")])
-    graph = create_agent(model)
-    answer, trace = respond(graph, "забронировать ближайший из сочи в москву")
+    class BookingModel(Model):
+        def invoke(self, messages):
+            self.contexts.append(messages)
+            human = next(str(m.content) for m in reversed(messages) if isinstance(m, HumanMessage))
+            if len(self.contexts) == 1:
+                return AIMessage(content="", tool_calls=[
+                    {"name": "prepare_booking", "args": {"origin": "Сочи", "destination": "Москва", "own": True}, "id": "p", "type": "tool_call"},
+                    {"name": "get_profile", "args": {}, "id": "g", "type": "tool_call"}])
+            if "PVT_" in human and not isinstance(messages[-1], ToolMessage):
+                import re
+                marker = re.search(r"PVT_[a-f0-9]{24}", human).group()
+                return call("book_flight", {"flight_number": "WRONG", "flight_date": "2027-01-01", "passenger_name": "Вадим Гутник", "passport": marker})
+            raise RuntimeError("Текст модели после инструмента не нужен")
+
+    model = BookingModel([])
+    store = FlightStore()
+    graph = create_agent(model, store)
+    answer, trace = respond(graph, "Заведи на меня ближайший рейс из сочи в москву")
     assert "Ближайший рейс:" in answer["message"]
-    assert trace[0]["result"]["flights"][0]["flight_number"] in answer["message"]
+    flight = trace[0]["result"]["flight"]
+    assert flight["flight_number"] in answer["message"]
+    assert answer["missing_fields"] == ["passenger_name", "passport"]
+    assert "count" not in trace[0]["result"]
     assert "Пришлите имя пассажира и 10 цифр паспорта." in answer["message"]
-    assert format_result(answer, trace).count(trace[0]["result"]["flights"][0]["flight_number"]) == 1
-    assert "Пришлите имя пассажира и 10 цифр паспорта." in format_result(answer, trace)
-    respond(graph, "Пассажир Иван")
-    assert any("Пришлите имя пассажира и 10 цифр паспорта." in str(m.content) for m in model.contexts[-1])
+    output = format_result(answer, trace)
+    assert output.count(flight["flight_number"]) == 1
+    assert "Пришлите имя пассажира и 10 цифр паспорта." in output
+    assert all(text not in output for text in ("Имя пользователя не сохранено", "Условия поиска", "Не удалось"))
+    booked, booking_trace = respond(graph, "Вадим Гутник, паспорт 1234567890")
+    assert booked["status"] == "booked" and booked["booking_id"] == "DEMO-0001"
+    assert (booked["flight_number"], booked["flight_date"]) == (flight["flight_number"], flight["departure"][:10])
+    assert store.get_profile()["name"] == "Вадим Гутник"
+    assert all(text not in format_result(booked, booking_trace) for text in ("Имя сохранено", "Не удалось", "Попробуйте"))
+    assert "1234567890" not in json.dumps([answer, trace, booked, booking_trace, graph.get_state({"configurable": {"thread_id": "cli"}}).values], default=str)
+    assert "1234567890" not in str(model.contexts)
     assert {"list_bookings", "cancel_booking", "update_booking"} <= model.tools
+    store.close()
 
 
 def test_management_tools_and_safe_formatting():
@@ -110,6 +135,86 @@ def test_booking_list_output_includes_data_even_with_natural_summary():
     store.close()
 
 
+@pytest.mark.parametrize(("reply", "diagnostic_code"), [
+    ("Ваше имя Иван. У вас одна активная бронь.", None),
+    ('{"status":', "invalid_format"),
+    ("", "empty_content"),
+])
+def test_profile_and_bookings_remain_visible_after_final_model_reply(reply, diagnostic_code):
+    store = FlightStore()
+    store.set_profile("Иван")
+    booking = store.book("SU123", "2027-06-10", "Иван", "1234567890")
+    model = Model([call("get_profile", {}, "profile"), call("list_bookings", {}, "bookings"), AIMessage(content=reply)])
+    answer, trace = respond(create_agent(model, store), "Привет, кто я и какие у меня брони?")
+    text = format_result(answer, trace)
+    assert "Ваше имя: Иван." in text and booking["booking_id"] in text
+    assert "Не удалось полностью обработать запрос" not in text and "Попробуйте" not in text
+    if diagnostic_code:
+        assert answer["diagnostic"]["source"] == "model"
+        assert answer["diagnostic"]["code"] == diagnostic_code
+    else:
+        assert "diagnostic" not in answer
+    store.close()
+
+
+def test_model_reply_failure_keeps_empty_booking_list_visible():
+    store = FlightStore()
+    model = Model([call("list_bookings", {}), AIMessage(content="")])
+    answer, trace = respond(create_agent(model, store), "Какие у меня брони?")
+    assert format_result(answer, trace) == "Активных броней нет."
+    assert answer["diagnostic"]["code"] == "empty_content"
+    store.close()
+
+
+def test_model_reply_failure_preserves_domain_error():
+    store = FlightStore()
+    model = Model([
+        call("list_bookings", {}, "bookings"),
+        call("flight_status", {"flight_number": "SU123", "flight_date": "ошибка"}, "flight"),
+        AIMessage(content=""),
+    ])
+    answer, trace = respond(create_agent(model, store), "Мои брони и статус рейса")
+    text = format_result(answer, trace)
+    assert "Активных броней нет." in text
+    assert "Дата должна быть в формате YYYY-MM-DD." in text
+    assert "Не удалось полностью обработать запрос" not in text
+    assert answer["diagnostic"]["code"] == "empty_content"
+    store.close()
+
+
+def test_profile_and_bookings_hide_unrelated_tool_failure():
+    class UnexpectedError(Exception):
+        pass
+
+    class Store(FlightStore):
+        def status(self, *args):
+            raise UnexpectedError("private detail")
+
+    store = Store()
+    try:
+        store.set_profile("Иван")
+        booking = store.book("SU123", "2027-06-10", "Иван", "1234567890")
+        model = Model([
+            call("flight_status", {"flight_number": "SU123"}, "flight"),
+            call("list_bookings", {}, "bookings"),
+            call("get_profile", {}, "profile"),
+            AIMessage(content="Ваше имя Иван. У вас одна активная бронь."),
+        ])
+        answer, trace = respond(create_agent(model, store), "Кто я и какие на мне брони есть?")
+        text = format_result(answer, trace)
+    finally:
+        store.close()
+
+    assert [(item["tool"], item["result"]["status"]) for item in trace] == [
+        ("flight_status", "error"), ("list_bookings", "ok"), ("get_profile", "ok"),
+    ]
+    assert answer["diagnostic"]["code"] == trace[0]["result"]["diagnostic"]["code"] == "other_error"
+    assert text.startswith(f"Бронь: {booking['booking_id']}\nРейс SU123")
+    assert text.endswith("Ваше имя: Иван.")
+    assert "private detail" not in str((answer, trace))
+    assert all(message not in text for message in ("Не удалось", "Данные сейчас недоступны.", "Повторите запрос"))
+
+
 def test_multiple_management_results_include_success_and_failure():
     from flight_agent.agent import prepare_answer
     records = [
@@ -139,11 +244,34 @@ def test_repeated_booking_rejection_not_printed():
     assert "Допускается" not in format_result(answer, records)
 
 
-def test_nearest_empty_and_model_search_arguments_are_corrected():
-    model = Model([call("search_flights", {"origin": "Несуществующий город"}), AIMessage(content="")])
+def test_successful_booking_does_not_require_model_restatement():
+    class FailingAfterTool(Model):
+        def invoke(self, messages):
+            if self.contexts:
+                raise RuntimeError("model unavailable")
+            self.contexts.append(messages)
+            import re
+            marker = re.search(r"PVT_[a-f0-9]{24}", str(messages[-1].content)).group()
+            return AIMessage(content="", tool_calls=[
+                {"name": "book_flight", "args": {"flight_number": "SU123", "flight_date": "2027-06-10", "passenger_name": "Иван", "passport": marker}, "id": "booking", "type": "tool_call"},
+                {"name": "search_flights", "args": {"flight_date": "ошибка"}, "id": "search", "type": "tool_call"},
+            ])
+
+    store = FlightStore()
+    model = FailingAfterTool([])
+    answer, trace = respond(create_agent(model, store), "Иван 1234567890")
+    assert answer["status"] == "booked"
+    output = format_result(answer, trace)
+    assert "Дата должна быть в формате YYYY-MM-DD." in output
+    assert "Не удалось" not in output
+    assert len(trace) == 2 and len(model.contexts) == 1
+    store.close()
+
+
+def test_prepare_booking_reports_no_matching_flight():
+    model = Model([call("prepare_booking", {"origin": "Несуществующий город", "destination": "Москва"})])
     answer, trace = respond(create_agent(model), "Забронируй ближайший рейс")
-    assert trace[0]["arguments"]["limit"] == 1
-    assert trace[0]["arguments"]["from_now"] is True
+    assert trace[0]["tool"] == "prepare_booking"
     assert "Нет подходящих рейсов" in answer["message"]
     assert "Нет подходящих рейсов" in format_result(answer, trace)
 
@@ -162,16 +290,18 @@ def test_profile_passport_requires_active_own_booking():
     store.close()
 
 
-def test_own_booking_context_stops_on_refusal_or_new_passenger():
-    for followup in ("не бронируй мне", "нет", "забронируй на имя Пётр", "а паспорт сохранён?"):
+def test_own_booking_context_stops_when_model_clears_selection():
+    for followup in ("не бронируй мне", "нет", "забронируй на имя Пётр"):
         store = FlightStore()
         store.set_profile("Иван")
         store.set_profile_passport("1234567890", "Иван")
-        model = Model([AIMessage(content="Хорошо"), AIMessage(content="Хорошо")])
+        model = Model([call("prepare_booking", {"origin": "Сочи", "destination": "Москва", "own": True}),
+                       call("clear_pending_booking", {}), AIMessage(content="Хорошо"), AIMessage(content="Хорошо")])
         graph = create_agent(model, store)
-        respond(graph, "Забронируй на себя ближайший рейс")
-        assert any("PVT_PROFILE" in str(m.content) for m in model.contexts[-1] if m.type == "system")
+        respond(graph, "Забронируй на себя ближайший рейс из Сочи в Москву")
         respond(graph, followup)
+        assert any("Для своей брони доступно имя профиля" in str(m.content) for m in model.contexts[-2] if m.type == "system")
+        respond(graph, "Что дальше?")
         assert not any("PVT_PROFILE" in str(m.content) for m in model.contexts[-1] if m.type == "system" and "Для своей брони" in str(m.content))
         store.close()
 
@@ -214,6 +344,8 @@ def test_active_own_booking_accepts_passport_on_followup_and_ends_after_success(
         def invoke(self, messages):
             self.contexts.append(messages)
             human = next(str(m.content) for m in reversed(messages) if isinstance(m, HumanMessage))
+            if len(self.contexts) == 1:
+                return call("prepare_booking", {"origin": "Сочи", "destination": "Москва", "own": True})
             if "PVT_" in human and not any(isinstance(m, ToolMessage) for m in messages[messages.index(next(m for m in reversed(messages) if isinstance(m, HumanMessage))) + 1:]):
                 marker = re.search(r"PVT_[a-f0-9]{24}", human).group()
                 return call("book_flight", {"flight_number": "SU123", "flight_date": "2027-06-10", "passenger_name": "Иван", "passport": marker})

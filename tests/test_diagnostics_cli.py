@@ -8,7 +8,7 @@ import openai
 import pytest
 from langchain_core.messages import AIMessage
 
-from flight_agent.__main__ import print_result, terminal_input
+from flight_agent.__main__ import format_result, print_result, terminal_input
 from flight_agent.agent import create_agent, respond
 from flight_agent.diagnostics import diagnostic
 
@@ -33,7 +33,7 @@ def test_model_http_errors_are_safe_and_informative(status, category):
     assert trace == []
     assert answer["diagnostic"]["category"] == category
     assert answer["diagnostic"]["http_status"] == status
-    assert answer["diagnostic"]["action"] in answer["message"]
+    assert answer["message"] == "Данные сейчас недоступны."
     assert "sk-supersecret" not in str(answer)
     assert "1234567890" not in str(answer)
 
@@ -61,7 +61,11 @@ def test_model_error_after_successful_tool_keeps_result_and_diagnostic():
     assert len(trace) == 1
 
 
-def test_tool_error_safe_and_visible():
+@pytest.mark.parametrize(("args", "code"), [
+    ({"flight_number": "SU123"}, "runtime_error"),
+    ({}, "invalid_tool_arguments"),
+])
+def test_tool_error_has_neutral_reply_and_preserves_diagnostic(args, code):
     class Store:
         def status(self, *args):
             raise RuntimeError("sk-secret паспорт 1234567890")
@@ -69,12 +73,14 @@ def test_tool_error_safe_and_visible():
     class Model(BrokenModel):
         def invoke(self, messages):
             if messages[-1].type == "human":
-                return AIMessage(content="", tool_calls=[{"name": "flight_status", "args": {"flight_number": "SU123"}, "id": "1", "type": "tool_call"}])
+                return AIMessage(content="", tool_calls=[{"name": "flight_status", "args": args, "id": "1", "type": "tool_call"}])
             return AIMessage(content=json.dumps({"status": "error"}))
 
     answer, trace = respond(create_agent(Model(None), Store()), "Статус")
     assert answer["diagnostic"]["source"] == "tool"
     assert trace[0]["result"]["diagnostic"]["category"] == "unexpected"
+    assert answer["diagnostic"]["code"] == trace[0]["result"]["diagnostic"]["code"] == code
+    assert format_result(answer, trace) == "Данные сейчас недоступны."
     assert "sk-secret" not in str([answer, trace])
     assert "1234567890" not in str([answer, trace])
 
@@ -145,13 +151,13 @@ def test_common_exception_codes_never_include_exception_text():
         assert "private" not in str(info)
 
 
-def test_cli_shows_natural_answers_and_diagnostic_action(capsys):
+def test_cli_shows_natural_answers_without_diagnostic_action(capsys):
     action = "Проверьте подключение и повторите запрос."
     answer = {"status": "missing_fields", "message": "Введите паспорт повторно, пожалуйста.", "missing_fields": ["passport"], "diagnostic": {"source": "model", "category": "timeout", "action": action}}
     print_result(answer, [])
     output = capsys.readouterr().out
     assert "Введите паспорт повторно, пожалуйста." in output
-    assert action in output
+    assert action not in output
     print_result({"status": "ok", "message": "Рейс задержан; паспорт 1234567890", "flight": {"flight_number": "SU123"}}, [{"tool": "flight_status", "arguments": {}, "result": {"status": "ok", "flight": {"flight_number": "SU123"}}}])
     output = capsys.readouterr().out
     assert "SU123" in output and "1234567890" not in output
