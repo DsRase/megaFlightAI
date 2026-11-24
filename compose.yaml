@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    environment:
+      LLM_API_KEY: ${LLM_API_KEY}
+    stdin_open: true
+    tty: true
+
+  tests:
+    build: .
+    profiles: [test]
+    command: ["python", "-m", "pytest", "-v", "-s"]
