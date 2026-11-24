@@ -1,8 +1,24 @@
 services:
-  app:
+  web:
     build: .
+    command: ["uvicorn", "flight_agent.web:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
     environment:
-      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      FLIGHT_DB_PATH: /data/flights.sqlite3
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sqlite_data:/data
+
+  cli:
+    build: .
+    profiles: [cli]
+    command: ["python", "-m", "flight_agent"]
+    environment:
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      FLIGHT_DB_PATH: /data/flights.sqlite3
+    volumes:
+      - sqlite_data:/data
     stdin_open: true
     tty: true
 
@@ -10,3 +26,6 @@ services:
     build: .
     profiles: [test]
     command: ["python", "-m", "pytest", "-v", "-s"]
+
+volumes:
+  sqlite_data:

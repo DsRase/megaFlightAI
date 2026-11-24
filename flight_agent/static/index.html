@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="light dark">
+  <title>Авиасвязь — ваш помощник в путешествиях</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="sky" aria-hidden="true">
+    <div class="stars"></div>
+    <div class="cloud cloud-one"></div><div class="cloud cloud-two"></div><div class="cloud cloud-three"></div>
+    <div class="plane plane-one">✈</div><div class="plane plane-two">✈</div><div class="plane plane-three">✈</div>
+  </div>
+  <div class="app-shell">
+    <header class="header">
+      <a class="brand" href="#top" aria-label="Авиасвязь — в начало">
+        <span class="brand-mark" aria-hidden="true">✈</span>
+        <span>авиасвязь<small>ВАШ ПОМОЩНИК В ПУТЕШЕСТВИЯХ</small></span>
+      </a>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Переключить тему"><span id="theme-icon" aria-hidden="true">☾</span><span class="theme-label" id="theme-label">Тёмная тема</span></button>
+    </header>
+
+    <main id="top" class="main">
+      <section class="intro" aria-labelledby="page-title">
+        <div class="eyebrow"><span></span> ПУТЕШЕСТВИЯ НАЧИНАЮТСЯ ЗДЕСЬ</div>
+        <h1 id="page-title">Куда отправимся <em>сегодня?</em></h1>
+        <p>Расскажите о своих планах — я помогу разобраться с перелётами и найти путь к новым впечатлениям.</p>
+      </section>
+
+      <p class="demo-notice">Учебное демо: используйте только вымышленные данные пассажира и паспорта. Реальный билет не оформляется.</p>
+      <section class="chat" aria-label="Чат с помощником">
+        <div class="chat-header">
+          <div class="assistant-avatar" aria-hidden="true">✳</div>
+          <div class="chat-heading"><strong>Ваш авиапомощник</strong><span><i></i> На связи</span></div>
+          <button id="clear-button" class="clear-button" type="button" aria-label="Очистить историю чата">Очистить чат</button>
+        </div>
+        <div class="messages" id="messages" role="log" aria-label="История сообщений" aria-live="polite" aria-relevant="additions">
+          <div class="message assistant-message"><div class="message-avatar" aria-hidden="true">✳</div><div class="message-content"><span class="message-author">АВИАПОМОЩНИК</span><p class="bubble">Здравствуйте! Я помогу вам с вопросами о перелётах. Куда планируете отправиться?</p></div></div>
+        </div>
+        <div class="composer-area">
+          <div id="error" class="error" role="alert" hidden></div>
+          <form id="chat-form" class="composer">
+            <label class="visually-hidden" for="message-input">Ваше сообщение</label>
+            <textarea id="message-input" name="message" rows="1" maxlength="8000" autocomplete="off" placeholder="Напишите, куда хотите полететь..." required></textarea>
+            <button id="send-button" type="submit" aria-label="Отправить сообщение"><span aria-hidden="true">↗</span></button>
+          </form>
+          <div class="composer-hint"><span>Enter — отправить <span aria-hidden="true">·</span> Shift + Enter — новая строка</span><span>Счастливого пути <span aria-hidden="true">✦</span></span></div>
+        </div>
+      </section>
+      <p class="footnote"><span aria-hidden="true">✧</span> Маленький шаг к большому путешествию</p>
+    </main>
+    <footer class="footer"><span>АВИАСВЯЗЬ <span aria-hidden="true">✳</span> ВАШ ПУТЕВОДИТЕЛЬ В НЕБЕ</span><span>СОЗДАНО ДЛЯ ПУТЕШЕСТВИЙ</span></footer>
+  </div>
+</body>
+</html>

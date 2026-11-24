@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "-m", "flight_agent"]
+CMD ["python", "-m", "flight_agent.web"]
